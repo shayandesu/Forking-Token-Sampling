@@ -6,7 +6,6 @@ import argparse
 try:
     from . import evaluate_pass_at_k
 except ImportError:
-    # Run as script: python post_processing/aime.py (no parent package)
     import sys
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:

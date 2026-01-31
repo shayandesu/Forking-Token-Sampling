@@ -42,10 +42,13 @@ def parse_args():
     ap.add_argument("-q", "--quantization", type=str, default=None, choices=[None, "bitsandbytes", "fp8"])
     ap.add_argument("--dtype", type=str, default="bfloat16", choices=["auto", "float16", "bfloat16"])
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+    ap.add_argument("--no_tqdm", action="store_true", help="Disable vLLM tqdm in generate()")
+    
 
     ap.add_argument("--samples", type=int, default=128)
     ap.add_argument("--chunk-size", type=int, default=16)
     ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--max_model_len", type=int, default=None)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=None)

@@ -20,6 +20,7 @@ def _worker(
     h_threshold: float,
     t_high: float,
     t_low: float,
+    no_tqdm: bool,
 ):
     # Important: set device visibility BEFORE importing vLLM/torch.
     if gpu_id is not None:
@@ -137,7 +138,7 @@ def _worker(
                 },
             )
 
-            res = llm.generate([prompt], [sp])[0]
+            res = llm.generate([prompt], [sp], use_tqdm=not no_tqdm)[0]
             all_outputs.extend([o.text for o in res.outputs])
 
         out_queue.put({
@@ -185,6 +186,9 @@ def main(args):
         "trust_remote_code": True,
         "gpu_memory_utilization": args.gpu_memory_utilization,
     }
+    
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
 
     # Load prompts
     df, prep = get_dataset(args.dataset_name)
@@ -222,6 +226,7 @@ def main(args):
                 args.h_threshold,
                 args.t_high,
                 args.t_low,
+                args.no_tqdm,
             ),
         )
         p.start()
