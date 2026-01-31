@@ -7,10 +7,10 @@ from utils import parse_args, get_dataset
 
 def _worker(
     gpu_id: int | None,
-    model: str,
+    llm_kwargs: dict,
     df_shard,
-    prompt_col: str,
     out_queue: mp.Queue,
+    prep: callable,
     samples: int,
     chunk_size: int,
     max_tokens: int,
@@ -103,15 +103,16 @@ def _worker(
             scale = torch.where(use_high, t_high, t_low)
             logits[rows] = (logits[rows].float() / scale[:, None]).to(logits.dtype)
             return logits
+        
+    llm_kwargs.update({
+        "logits_processors": [EntropyTempGate],
+    })
 
-    llm = LLM(
-        model=model,
-        logits_processors=[EntropyTempGate],  # offline: pass class object
-    )
+    llm = LLM(**llm_kwargs)
 
     # Process prompts (iterate over dataframe shard)
     for qid, row in df_shard.iterrows():
-        prompt = row[prompt_col]
+        prompt = prep(row["Problem"])
         all_outputs = []
         n_calls = math.ceil(samples / chunk_size)
 
@@ -169,6 +170,15 @@ def main(args):
         gpus = [int(x) for x in args.gpus.split(",") if x.strip() != ""]
     if not gpus:
         gpus = [None]  # single CPU worker
+        
+        
+    llm_kwargs = {
+        "model": args.model,
+        "dtype": args.dtype,
+        "quantization": args.quantization,
+        "trust_remote_code": True,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+    }
 
     # Load prompts
     df, prep = get_dataset(args.dataset_name)
@@ -193,9 +203,10 @@ def main(args):
             target=_worker,
             args=(
                 gpu_id,
-                args.model,
+                llm_kwargs,
                 shards[rank],
                 q,
+                prep,
                 args.samples,
                 args.chunk_size,
                 args.max_tokens,
