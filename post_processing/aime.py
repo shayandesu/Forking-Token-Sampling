@@ -1,10 +1,19 @@
 import os
 import re
 import json
-
-from . import evaluate_pass_at_k
-from utils import get_dataset
 import argparse
+
+try:
+    from . import evaluate_pass_at_k
+except ImportError:
+    # Run as script: python post_processing/aime.py (no parent package)
+    import sys
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from post_processing import evaluate_pass_at_k
+
+from utils import get_dataset
 
 
 def extract_answer_from_response(response):
