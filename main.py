@@ -167,7 +167,13 @@ def main(args):
         # Use logical indices 0..n-1 for the n visible devices (workers will each see one).
         gpus = list(range(len([x for x in cvd.split(",") if x.strip()])))
     else:
-        gpus = [int(x) for x in args.gpus.split(",") if x.strip() != ""]
+        gpu_arg = (args.gpus or "").strip().lower()
+        if gpu_arg == "all":
+            import torch
+            n = torch.cuda.device_count()
+            gpus = list(range(n)) if n > 0 else []
+        else:
+            gpus = [int(x) for x in args.gpus.split(",") if x.strip() != ""]
     if not gpus:
         gpus = [None]  # single CPU worker
         

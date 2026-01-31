@@ -39,6 +39,9 @@ def parse_args():
     ap.add_argument("--model", type=str, default="Qwen/Qwen3-8B-AWQ")
     ap.add_argument('-d', "--dataset-name", type=str, required=True)
     ap.add_argument("--out-path", type=str, required=True)
+    ap.add_argument("-q", "--quantization", type=str, default=None, choices=[None, "bitsandbytes", "fp8"])
+    ap.add_argument("--dtype", type=str, default="bfloat16", choices=["auto", "float16", "bfloat16"])
+    ap.add_argument("--gpu_memory_utilization", type=float, default=0.9)
 
     ap.add_argument("--samples", type=int, default=128)
     ap.add_argument("--chunk-size", type=int, default=16)
@@ -48,7 +51,7 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=None)
 
     ap.add_argument("--h-threshold", type=float, default=0.672)
-    ap.add_argument("--t-high", type=float, default=1.5)
+    ap.add_argument("--t-high", type=float, default=2.0)
     ap.add_argument("--t-low", type=float, default=0.7)
 
     ap.add_argument("--gpus", type=str, default="all")
