@@ -56,6 +56,19 @@ def parse_args():
     ap.add_argument("--h-threshold", type=float, default=0.672)
     ap.add_argument("--t-high", type=float, default=2.0)
     ap.add_argument("--t-low", type=float, default=0.7)
+    ap.add_argument(
+        "--entropy-gate-mode",
+        type=str,
+        default="temp",
+        choices=["temp", "topk"],
+        help="When entropy > threshold: 'temp' = sample with higher temperature; 'topk' = choose uniformly from top-k tokens",
+    )
+    ap.add_argument(
+        "--entropy-gate-top-k",
+        type=int,
+        default=5,
+        help="For entropy-gate-mode=topk: number of top candidate tokens to sample from uniformly",
+    )
 
     ap.add_argument("--gpus", type=str, default="all")
     args = ap.parse_args()

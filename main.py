@@ -20,6 +20,8 @@ def _worker(
     h_threshold: float,
     t_high: float,
     t_low: float,
+    entropy_gate_mode: str,
+    entropy_gate_top_k: int,
     no_tqdm: bool,
 ):
     # Important: set device visibility BEFORE importing vLLM/torch.
@@ -47,15 +49,21 @@ def _worker(
                 t_ref = extra.get("t_ref", 1.0)  # temperature for entropy calc only
                 t_high = extra.get("t_high", 1.5)
                 t_low = extra.get("t_low", 0.7)
+                mode = extra.get("entropy_gate_mode", "temp")
+                top_k = extra.get("entropy_gate_top_k", 5)
                 for name, val in (("h_threshold", h), ("t_ref", t_ref), ("t_high", t_high), ("t_low", t_low)):
                     if not isinstance(val, (float, int)):
                         raise ValueError(f"{name} must be a number")
                 if t_high <= 0 or t_low <= 0 or t_ref <= 0:
                     raise ValueError("t_ref, t_high, and t_low must be > 0")
+                if mode not in ("temp", "topk"):
+                    raise ValueError("entropy_gate_mode must be 'temp' or 'topk'")
+                if not isinstance(top_k, int) or top_k < 1:
+                    raise ValueError("entropy_gate_top_k must be a positive integer")
 
         def __init__(self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool):
-            # req_info: request_id -> (h_threshold, t_ref, t_high, t_low)
-            self.req_info: dict[int, tuple[float, float, float, float]] = {}
+            # req_info: request_id -> (h_threshold, t_ref, t_high, t_low, mode, top_k)
+            self.req_info: dict[int, tuple[float, float, float, float, str, int]] = {}
 
         def is_argmax_invariant(self) -> bool:
             return False
@@ -71,6 +79,8 @@ def _worker(
                     float(extra.get("t_ref", 1.0)),
                     float(extra.get("t_high", 1.5)),
                     float(extra.get("t_low", 0.7)),
+                    str(extra.get("entropy_gate_mode", "temp")),
+                    int(extra.get("entropy_gate_top_k", 5)),
                 )
 
             process_dict_updates(
@@ -85,14 +95,13 @@ def _worker(
                 return logits
 
             rows = torch.tensor(list(self.req_info.keys()), device=logits.device, dtype=torch.long)
-            h_thr = torch.tensor([self.req_info[i][0] for i in self.req_info.keys()],
-                                 device=logits.device, dtype=torch.float32)
-            t_ref = torch.tensor([self.req_info[i][1] for i in self.req_info.keys()],
-                                device=logits.device, dtype=torch.float32)
-            t_high = torch.tensor([self.req_info[i][2] for i in self.req_info.keys()],
-                                  device=logits.device, dtype=torch.float32)
-            t_low = torch.tensor([self.req_info[i][3] for i in self.req_info.keys()],
-                                device=logits.device, dtype=torch.float32)
+            infos = [self.req_info[i] for i in self.req_info.keys()]
+            h_thr = torch.tensor([x[0] for x in infos], device=logits.device, dtype=torch.float32)
+            t_ref = torch.tensor([x[1] for x in infos], device=logits.device, dtype=torch.float32)
+            t_high = torch.tensor([x[2] for x in infos], device=logits.device, dtype=torch.float32)
+            t_low = torch.tensor([x[3] for x in infos], device=logits.device, dtype=torch.float32)
+            modes = [x[4] for x in infos]
+            top_ks = [x[5] for x in infos]
 
             sel = logits[rows].float()
             # Entropy at args.temperature (t_ref)
@@ -100,9 +109,26 @@ def _worker(
             p = torch.exp(logp)
             H = -(p * logp).sum(dim=-1)
 
-            use_high = H > h_thr
-            scale = torch.where(use_high, t_high, t_low)
-            logits[rows] = (logits[rows].float() / scale[:, None]).to(logits.dtype)
+            # Process each row; some may use temp scaling, others top-k uniform
+            out = logits[rows].float().clone()
+            for idx, (use_high, mode, k) in enumerate(
+                zip(H > h_thr, modes, top_ks)
+            ):
+                if mode == "temp":
+                    scale = t_high[idx] if use_high else t_low[idx]
+                    out[idx] = out[idx] / scale
+                else:  # mode == "topk"
+                    if use_high:
+                        # Top-k by probability; mask others to -inf, set top-k to 0 for uniform
+                        _, top_indices = torch.topk(sel[idx], min(k, sel.shape[1]))
+                        mask = torch.full_like(out[idx], float("-inf"))
+                        mask[top_indices] = 0.0
+                        out[idx] = mask
+                    else:
+                        # Low entropy: use t_low temperature scaling
+                        out[idx] = out[idx] / t_low[idx]
+
+            logits[rows] = out.to(logits.dtype)
             return logits
         
     llm_kwargs.update({
@@ -126,7 +152,7 @@ def _worker(
                 n=n,
                 max_tokens=max_tokens,
                 temperature=1.0,  # gate sets effective temp via t_high/t_low; vLLM must not scale again
-                top_p=top_p,
+                top_p=1.0 if entropy_gate_mode == "topk" else top_p,
                 seed=None if seed is None else (seed + c),
                 output_kind=RequestOutputKind.FINAL_ONLY,
                 extra_args={
@@ -135,6 +161,8 @@ def _worker(
                     "t_ref": temperature,  # temperature for initial entropy calculation only
                     "t_high": t_high,
                     "t_low": t_low,
+                    "entropy_gate_mode": entropy_gate_mode,
+                    "entropy_gate_top_k": entropy_gate_top_k,
                 },
             )
 
@@ -226,6 +254,8 @@ def main(args):
                 args.h_threshold,
                 args.t_high,
                 args.t_low,
+                args.entropy_gate_mode,
+                args.entropy_gate_top_k,
                 args.no_tqdm,
             ),
         )
