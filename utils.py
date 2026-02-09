@@ -26,6 +26,8 @@ def get_dataset(name):
         df = load_dataset("HuggingFaceH4/MATH-500")['test'].to_pandas()
         df.rename(columns={"problem": "Problem", "answer": "Answer"}, inplace=True)
         prep = build_prompt
+    elif ds_name == "lcb":
+        df = load_dataset("livecodebench/code_generation_lite", version_tag="release_v2")
     else:
         try:
             df = load_dataset(name).to_pandas()
@@ -34,28 +36,28 @@ def get_dataset(name):
     
     return df, prep
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=str, default="Qwen/Qwen3-8B-AWQ")
+    ap.add_argument("--model", type=str, default="Qwen/Qwen3-8B")
     ap.add_argument('-d', "--dataset-name", type=str, required=True)
     ap.add_argument("--out-path", type=str, required=True)
     ap.add_argument("-q", "--quantization", type=str, default=None, choices=[None, "bitsandbytes", "fp8"])
     ap.add_argument("--dtype", type=str, default="bfloat16", choices=["auto", "float16", "bfloat16"])
-    ap.add_argument("--gpu_memory_utilization", type=float, default=0.9)
-    ap.add_argument("--no_tqdm", action="store_true", help="Disable vLLM tqdm in generate()")
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    ap.add_argument("--no-tqdm", action="store_true", help="Disable vLLM tqdm in generate()")
     
 
     ap.add_argument("--samples", type=int, default=128)
     ap.add_argument("--chunk-size", type=int, default=16)
-    ap.add_argument("--max-tokens", type=int, default=2048)
-    ap.add_argument("--max_model_len", type=int, default=None)
+    ap.add_argument("--max-tokens", type=int, default=20000)
+    ap.add_argument("--max-model-len", type=int, default=None)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=None)
 
     ap.add_argument("--h-threshold", type=float, default=0.672)
     ap.add_argument("--t-high", type=float, default=2.0)
-    ap.add_argument("--t-low", type=float, default=0.7)
+    ap.add_argument("--t-low", type=float, default=0.6)
     ap.add_argument(
         "--entropy-gate-mode",
         type=str,
@@ -71,6 +73,6 @@ def parse_args():
     )
 
     ap.add_argument("--gpus", type=str, default="all")
-    args = ap.parse_args()
+    args = ap.parse_args(args=argv)
     
     return args

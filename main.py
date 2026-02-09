@@ -2,13 +2,49 @@ import os
 import json
 import math
 import multiprocessing as mp
+import tempfile
 from utils import parse_args, get_dataset
+from tqdm import tqdm
+from pathlib import Path
+
+
+def _write_results(results: dict, df, out_path: Path) -> None:
+    """Atomically write merged results to out_path in df.index order."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".jsonl", delete=False, dir=out_path.parent
+    ) as f_out:
+        tmp_path = Path(f_out.name)
+        for qid in df.index:
+            if qid in results:
+                f_out.write(json.dumps(results[qid], ensure_ascii=False) + "\n")
+    tmp_path.replace(out_path)
+
+
+def _load_existing(out_path: Path, samples: int) -> dict:
+    """Load existing output file. Returns {qid: record} for completed and incomplete questions."""
+    result = {}
+    if not out_path.exists():
+        return result
+    with open(out_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            qid = rec.get("id")
+            if qid is None:
+                continue
+            result[qid] = rec
+    return result
 
 
 def _worker(
     gpu_id: int | None,
     llm_kwargs: dict,
-    df_shard,
+    todo_shard: list,
     out_queue: mp.Queue,
     prep: callable,
     samples: int,
@@ -36,6 +72,8 @@ def _worker(
     from vllm.v1.sample.logits_processor import LogitsProcessor, BatchUpdate
     from vllm.v1.sample.logits_processor.builtin import process_dict_updates
     from vllm.sampling_params import RequestOutputKind
+
+    forking_stats = [0, 0]  # [count_high_entropy, count_total] — mutated by EntropyTempGate.apply
 
     class EntropyTempGate(LogitsProcessor):
         @classmethod
@@ -129,31 +167,40 @@ def _worker(
                         out[idx] = out[idx] / t_low[idx]
 
             logits[rows] = out.to(logits.dtype)
+
+            # Record forking tokens (H > threshold)
+            high = (H > h_thr).sum().item()
+            forking_stats[0] += high
+            forking_stats[1] += H.numel()
+
             return logits
-        
+
     llm_kwargs.update({
         "logits_processors": [EntropyTempGate],
     })
 
     llm = LLM(**llm_kwargs)
 
-    # Process prompts (iterate over dataframe shard)
-    for qid, row in df_shard.iterrows():
-        prompt = prep(row["Problem"])
-        all_outputs = []
-        n_calls = math.ceil(samples / chunk_size)
+    # Process prompts (each item: (qid, problem_text, existing_generations))
+    for qid, problem_text, existing_gens in todo_shard:
+        prompt = prep(problem_text)
+        all_outputs = list(existing_gens) if existing_gens else []
+        samples_needed = samples - len(all_outputs)
+        n_calls = math.ceil(samples_needed / chunk_size) if samples_needed > 0 else 0
+        chunk_offset = len(all_outputs) // chunk_size
 
         for c in range(n_calls):
-            n = min(chunk_size, samples - c * chunk_size)
+            n = min(chunk_size, samples_needed - c * chunk_size)
             if n <= 0:
                 break
 
+            forking_stats[0] = forking_stats[1] = 0
             sp = SamplingParams(
                 n=n,
                 max_tokens=max_tokens,
                 temperature=1.0,  # gate sets effective temp via t_high/t_low; vLLM must not scale again
                 top_p=1.0 if entropy_gate_mode == "topk" else top_p,
-                seed=None if seed is None else (seed + c),
+                seed=None if seed is None else (seed + chunk_offset + c),
                 output_kind=RequestOutputKind.FINAL_ONLY,
                 extra_args={
                     "entropy_gate": True,
@@ -168,6 +215,19 @@ def _worker(
 
             res = llm.generate([prompt], [sp], use_tqdm=not no_tqdm)[0]
             all_outputs.extend([o.text for o in res.outputs])
+            n_high, n_total = forking_stats[0], forking_stats[1]
+            pct = 100.0 * n_high / n_total if n_total > 0 else 0.0
+            out_queue.put({
+                "type": "progress",
+                "gpu": gpu_id,
+                "qid": int(qid),
+                "call": c + 1,
+                "total": n_calls,
+                "forking_count": n_high,
+                "forking_pct": pct,
+                "token_count": n_total,
+            })
+
 
         out_queue.put({
             "id": qid,
@@ -221,16 +281,41 @@ def main(args):
     # Load prompts
     df, prep = get_dataset(args.dataset_name)
 
-    # Split df across workers (CPU: 1 worker, GPU: len(gpus) workers)
+    out_path = Path(args.out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load existing output and determine what to run
+    existing = _load_existing(out_path, args.samples)
+    results: dict = {qid: existing[qid] for qid in existing if len(existing[qid].get("generations", [])) >= args.samples}
+
+    # Build todo shards: list of (qid, problem_text, existing_generations)
+    # Skip fully completed; include incomplete and not-started
     n_workers = len(gpus)
     size = len(df)
     base, extra = divmod(size, n_workers)
-    shards = []
+    todo_shards = [[] for _ in range(n_workers)]
     start = 0
     for i in range(n_workers):
         count = base + (1 if i < extra else 0)
-        shards.append(df.iloc[start : start + count])
+        for j in range(count):
+            qid = df.index[start + j]
+            if qid in results:
+                continue
+            rec = existing.get(qid, {})
+            existing_gens = rec.get("generations", [])
+            problem_text = df.loc[qid, "Problem"]
+            todo_shards[i].append((qid, problem_text, existing_gens))
         start += count
+
+    n_todo = sum(len(s) for s in todo_shards)
+    if n_todo == 0:
+        print(f"All {size} questions already completed. Nothing to do.", flush=True)
+        return
+
+    if results:
+        print(f"Resuming: {len(results)} completed, {n_todo} to process.", flush=True)
+    else:
+        print(f"Starting: {n_todo} questions to process.", flush=True)
 
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
@@ -242,7 +327,7 @@ def main(args):
             args=(
                 gpu_id,
                 llm_kwargs,
-                shards[rank],
+                todo_shards[rank],
                 q,
                 prep,
                 args.samples,
@@ -263,14 +348,23 @@ def main(args):
         procs.append(p)
 
     done = 0
-    with open(args.out_path, "w", encoding="utf-8") as f_out:
-        while done < len(procs):
-            msg = q.get()
-            if msg is None:
-                done += 1
-                continue
-            f_out.write(json.dumps(msg, ensure_ascii=False) + "\n")
-            f_out.flush()
+    while done < len(procs):
+        msg = q.get()
+        if msg is None:
+            done += 1
+            continue
+        if msg.get("type") == "progress":
+            fc = msg.get("forking_count", 0)
+            fp = msg.get("forking_pct", 0.0)
+            tc = msg.get("token_count", 0)
+            print(
+                f"[gpu {msg['gpu']}] qid={msg['qid']} {msg['call']}/{msg['total']} "
+                f"— forking tokens: {fc}/{tc} ({fp:.1f}%)",
+                flush=True,
+            )
+            continue
+        results[msg["id"]] = msg
+        _write_results(results, df, out_path)
 
     for p in procs:
         p.join()

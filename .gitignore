@@ -1,1 +1,6 @@
+__pycache__/
 .vscode
+test.py
+test.ipynb
+remote.py
+run.sh
