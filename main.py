@@ -5,8 +5,8 @@ import multiprocessing as mp
 import tempfile
 from utils import parse_args, get_dataset
 from tqdm import tqdm
+from pprint import pprint
 from pathlib import Path
-
 
 def _write_results(results: dict, df, out_path: Path) -> None:
     """Atomically write merged results to out_path in df.index order."""
@@ -17,14 +17,14 @@ def _write_results(results: dict, df, out_path: Path) -> None:
         for qid in df.index:
             if qid in results:
                 f_out.write(json.dumps(results[qid], ensure_ascii=False) + "\n")
-    tmp_path.replace(out_path)
-
+        tmp_path.replace(out_path)
 
 def _load_existing(out_path: Path, samples: int) -> dict:
     """Load existing output file. Returns {qid: record} for completed and incomplete questions."""
     result = {}
     if not out_path.exists():
         return result
+
     with open(out_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -38,8 +38,8 @@ def _load_existing(out_path: Path, samples: int) -> dict:
             if qid is None:
                 continue
             result[qid] = rec
-    return result
 
+    return result
 
 def _worker(
     gpu_id: int | None,
@@ -73,7 +73,10 @@ def _worker(
     from vllm.v1.sample.logits_processor.builtin import process_dict_updates
     from vllm.sampling_params import RequestOutputKind
 
-    forking_stats = [0, 0]  # [count_high_entropy, count_total] — mutated by EntropyTempGate.apply
+    # Shared state for stats
+    _mgr = mp.Manager()
+    forking_stats = _mgr.list([0, 0])
+    entropy_collector = _mgr.list()  # collect H values (CPU floats) during generation
 
     class EntropyTempGate(LogitsProcessor):
         @classmethod
@@ -84,11 +87,12 @@ def _worker(
                 raise ValueError("extra_args['entropy_gate'] must be bool")
             if enabled:
                 h = extra.get("h_threshold", 0.672)
-                t_ref = extra.get("t_ref", 1.0)  # temperature for entropy calc only
+                t_ref = extra.get("t_ref", 1.0)
                 t_high = extra.get("t_high", 1.5)
                 t_low = extra.get("t_low", 0.7)
                 mode = extra.get("entropy_gate_mode", "temp")
                 top_k = extra.get("entropy_gate_top_k", 5)
+
                 for name, val in (("h_threshold", h), ("t_ref", t_ref), ("t_high", t_high), ("t_low", t_low)):
                     if not isinstance(val, (float, int)):
                         raise ValueError(f"{name} must be a number")
@@ -100,7 +104,6 @@ def _worker(
                     raise ValueError("entropy_gate_top_k must be a positive integer")
 
         def __init__(self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool):
-            # req_info: request_id -> (h_threshold, t_ref, t_high, t_low, mode, top_k)
             self.req_info: dict[int, tuple[float, float, float, float, str, int]] = {}
 
         def is_argmax_invariant(self) -> bool:
@@ -128,12 +131,12 @@ def _worker(
             )
 
         def apply(self, logits: torch.Tensor) -> torch.Tensor:
-            # logits: (num_requests, vocab_size)
             if not self.req_info:
                 return logits
 
             rows = torch.tensor(list(self.req_info.keys()), device=logits.device, dtype=torch.long)
             infos = [self.req_info[i] for i in self.req_info.keys()]
+
             h_thr = torch.tensor([x[0] for x in infos], device=logits.device, dtype=torch.float32)
             t_ref = torch.tensor([x[1] for x in infos], device=logits.device, dtype=torch.float32)
             t_high = torch.tensor([x[2] for x in infos], device=logits.device, dtype=torch.float32)
@@ -142,49 +145,57 @@ def _worker(
             top_ks = [x[5] for x in infos]
 
             sel = logits[rows].float()
-            # Entropy at args.temperature (t_ref)
+
             logp = torch.log_softmax(sel / t_ref[:, None], dim=-1)
             p = torch.exp(logp)
             H = -(p * logp).sum(dim=-1)
 
-            # Process each row; some may use temp scaling, others top-k uniform
+            # Collect entropy values (detach + CPU immediately to avoid GPU memory issues)
+            collector = getattr(EntropyTempGate, "_entropy_collector", None)
+            if collector is not None:
+                for val in H.detach().cpu().tolist():
+                    collector.append(val)
+
+            # Process each row
             out = logits[rows].float().clone()
-            for idx, (use_high, mode, k) in enumerate(
-                zip(H > h_thr, modes, top_ks)
-            ):
+            for idx, (use_high, mode, k) in enumerate(zip(H > h_thr, modes, top_ks)):
                 if mode == "temp":
                     scale = t_high[idx] if use_high else t_low[idx]
                     out[idx] = out[idx] / scale
                 else:  # mode == "topk"
                     if use_high:
-                        # Top-k by probability; mask others to -inf, set top-k to 0 for uniform
                         _, top_indices = torch.topk(sel[idx], min(k, sel.shape[1]))
                         mask = torch.full_like(out[idx], float("-inf"))
                         mask[top_indices] = 0.0
                         out[idx] = mask
                     else:
-                        # Low entropy: use t_low temperature scaling
                         out[idx] = out[idx] / t_low[idx]
 
             logits[rows] = out.to(logits.dtype)
 
-            # Record forking tokens (H > threshold)
+            # Record forking tokens
             high = (H > h_thr).sum().item()
-            forking_stats[0] += high
-            forking_stats[1] += H.numel()
+            stats = getattr(EntropyTempGate, "_forking_stats", None)
+            if stats is not None:
+                stats[0] = stats[0] + high
+                stats[1] = stats[1] + H.numel()
 
             return logits
 
-    llm_kwargs.update({
-        "logits_processors": [EntropyTempGate],
-    })
+    EntropyTempGate._forking_stats = forking_stats
+    EntropyTempGate._entropy_collector = entropy_collector
 
+    llm_kwargs.update({"logits_processors": [EntropyTempGate]})
     llm = LLM(**llm_kwargs)
 
-    # Process prompts (each item: (qid, problem_text, existing_generations))
+    # Process prompts
     for qid, problem_text, existing_gens in todo_shard:
         prompt = prep(problem_text)
         all_outputs = list(existing_gens) if existing_gens else []
+
+        # Clear entropy collector for this qid
+        entropy_collector[:] = []
+
         samples_needed = samples - len(all_outputs)
         n_calls = math.ceil(samples_needed / chunk_size) if samples_needed > 0 else 0
         chunk_offset = len(all_outputs) // chunk_size
@@ -195,17 +206,18 @@ def _worker(
                 break
 
             forking_stats[0] = forking_stats[1] = 0
+
             sp = SamplingParams(
                 n=n,
                 max_tokens=max_tokens,
-                temperature=1.0,  # gate sets effective temp via t_high/t_low; vLLM must not scale again
+                temperature=1.0,
                 top_p=1.0 if entropy_gate_mode == "topk" else top_p,
                 seed=None if seed is None else (seed + chunk_offset + c),
                 output_kind=RequestOutputKind.FINAL_ONLY,
                 extra_args={
                     "entropy_gate": True,
                     "h_threshold": h_threshold,
-                    "t_ref": temperature,  # temperature for initial entropy calculation only
+                    "t_ref": temperature,
                     "t_high": t_high,
                     "t_low": t_low,
                     "entropy_gate_mode": entropy_gate_mode,
@@ -215,8 +227,10 @@ def _worker(
 
             res = llm.generate([prompt], [sp], use_tqdm=not no_tqdm)[0]
             all_outputs.extend([o.text for o in res.outputs])
+
             n_high, n_total = forking_stats[0], forking_stats[1]
             pct = 100.0 * n_high / n_total if n_total > 0 else 0.0
+
             out_queue.put({
                 "type": "progress",
                 "gpu": gpu_id,
@@ -228,7 +242,29 @@ def _worker(
                 "token_count": n_total,
             })
 
+        # Compute entropy stats for this qid
+        ent_vals = list(entropy_collector)
+        if ent_vals:
+            import torch as torch_local
+            ent_t = torch_local.tensor(ent_vals, dtype=torch_local.float32)
+            ent_mean = float(ent_t.mean().item())
+            ent_p80 = float(torch_local.quantile(ent_t, 0.8).item())
+            ent_n = len(ent_vals)
+        else:
+            ent_mean, ent_p80, ent_n = None, None, 0
 
+        # Send entropy stats
+        out_queue.put({
+            "type": "entropy_stats",
+            "gpu": gpu_id,
+            "qid": int(qid),
+            "entropy_avg": ent_mean,
+            "entropy_p80": ent_p80,
+            "entropy_n": ent_n,
+            "entropy_values": ent_vals,  # send raw values for global aggregation
+        })
+
+        # Send final result for this qid
         out_queue.put({
             "id": qid,
             "prompt": prompt,
@@ -243,17 +279,19 @@ def _worker(
                 "t_ref": temperature,
                 "t_high": t_high,
                 "t_low": t_low,
+                "entropy_avg": ent_mean,
+                "entropy_p80": ent_p80,
             }
         })
 
     out_queue.put(None)  # worker done sentinel
 
-
 def main(args):
-    # Resolve devices: CUDA_VISIBLE_DEVICES if set, else args.gpus; fallback to single CPU worker if none.
+    pprint(vars(args), sort_dicts=False)
+
+    # Resolve devices
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     if cvd:
-        # Use logical indices 0..n-1 for the n visible devices (workers will each see one).
         gpus = list(range(len([x for x in cvd.split(",") if x.strip()])))
     else:
         gpu_arg = (args.gpus or "").strip().lower()
@@ -263,38 +301,36 @@ def main(args):
             gpus = list(range(n)) if n > 0 else []
         else:
             gpus = [int(x) for x in args.gpus.split(",") if x.strip() != ""]
+
     if not gpus:
-        gpus = [None]  # single CPU worker
-        
-        
+        gpus = [None]
+
     llm_kwargs = {
         "model": args.model,
         "dtype": args.dtype,
         "quantization": args.quantization,
-        "trust_remote_code": True,
         "gpu_memory_utilization": args.gpu_memory_utilization,
     }
-    
+
     if args.max_model_len is not None:
         llm_kwargs["max_model_len"] = args.max_model_len
 
     # Load prompts
     df, prep = get_dataset(args.dataset_name)
-
     out_path = Path(args.out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Load existing output and determine what to run
+    # Load existing output
     existing = _load_existing(out_path, args.samples)
     results: dict = {qid: existing[qid] for qid in existing if len(existing[qid].get("generations", [])) >= args.samples}
 
-    # Build todo shards: list of (qid, problem_text, existing_generations)
-    # Skip fully completed; include incomplete and not-started
+    # Build todo shards
     n_workers = len(gpus)
     size = len(df)
     base, extra = divmod(size, n_workers)
     todo_shards = [[] for _ in range(n_workers)]
     start = 0
+
     for i in range(n_workers):
         count = base + (1 if i < extra else 0)
         for j in range(count):
@@ -308,6 +344,7 @@ def main(args):
         start += count
 
     n_todo = sum(len(s) for s in todo_shards)
+
     if n_todo == 0:
         print(f"All {size} questions already completed. Nothing to do.", flush=True)
         return
@@ -348,11 +385,15 @@ def main(args):
         procs.append(p)
 
     done = 0
+    global_entropy_values = []
+
     while done < len(procs):
         msg = q.get()
+
         if msg is None:
             done += 1
             continue
+
         if msg.get("type") == "progress":
             fc = msg.get("forking_count", 0)
             fp = msg.get("forking_pct", 0.0)
@@ -363,12 +404,50 @@ def main(args):
                 flush=True,
             )
             continue
+
+        if msg.get("type") == "entropy_stats":
+            avg = msg.get("entropy_avg")
+            p80 = msg.get("entropy_p80")
+            n = msg.get("entropy_n", 0)
+
+            avg_s = f"{avg:.4f}" if avg is not None else "N/A"
+            p80_s = f"{p80:.4f}" if p80 is not None else "N/A"
+
+            print(
+                f"[gpu {msg['gpu']}] qid={msg['qid']} "
+                f"entropy(avg={avg_s}, p80={p80_s}, n={n})",
+                flush=True,
+            )
+
+            # Accumulate entropy values for global stats
+            ent_vals = msg.get("entropy_values", [])
+            if ent_vals:
+                global_entropy_values.extend(ent_vals)
+
+            continue
+
         results[msg["id"]] = msg
         _write_results(results, df, out_path)
 
     for p in procs:
         p.join()
 
+    # Print global entropy stats
+    if global_entropy_values:
+        import torch
+        global_ent = torch.tensor(global_entropy_values, dtype=torch.float32)
+        global_avg = float(global_ent.mean().item())
+        global_p80 = float(torch.quantile(global_ent, 0.8).item())
+        global_n = len(global_entropy_values)
+
+        print("\n" + "="*60, flush=True)
+        print(
+            f"GLOBAL ENTROPY STATS: avg={global_avg:.4f}, p80={global_p80:.4f}, n={global_n}",
+            flush=True,
+        )
+        print("="*60 + "\n", flush=True)
+    else:
+        print("\nNo entropy values collected.\n", flush=True)
 
 if __name__ == "__main__":
     args = parse_args()
