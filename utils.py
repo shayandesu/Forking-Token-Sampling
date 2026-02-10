@@ -3,11 +3,29 @@ import argparse
 from datasets import load_dataset
 
 
-def build_prompt(question):
+def build_prompt_aime(question):
     return (
         "Please reason step by step, and put your final answer within \\boxed{}\n"
         f"{question}"
     )
+    
+def build_prompt_lcb(question):
+    return (
+        "You are an expert Python programmer.\n"
+        "You will be given a programming problem and must generate a correct "
+        "Python solution that matches the specification and passes all "
+        "tests.\n\n"
+        f"{question}\n\n"
+        "Format:\n"
+        "You will use the following starter code to write the solution "
+        "and enclose your code within backticks."
+        "```python\n"
+        "class Solution:\n"
+        "    def solve(self, ...):\n"
+        "        pass\n\n"
+        "Answer:"
+    )
+    
 
 def get_dataset(name):
     ds_name = name.lower().strip()
@@ -15,19 +33,22 @@ def get_dataset(name):
     if ds_name == "aime2024":
         ds = load_dataset("Maxwell-Jia/AIME_2024")
         df = ds["train"].to_pandas()
-        prep = build_prompt
+        prep = build_prompt_aime
     elif ds_name =="aime2025":
         df1 = load_dataset("opencompass/AIME2025", "AIME2025-I")['test'].to_pandas()
         df2 = load_dataset("opencompass/AIME2025", "AIME2025-I")['test'].to_pandas()
         df = pd.concat([df1, df2])
         df.rename(columns={"question": "Problem", "answer": "Answer"}, inplace=True)
-        prep = build_prompt
+        prep = build_prompt_aime
     elif ds_name == "math500":
         df = load_dataset("HuggingFaceH4/MATH-500")['test'].to_pandas()
         df.rename(columns={"problem": "Problem", "answer": "Answer"}, inplace=True)
-        prep = build_prompt
+        prep = build_prompt_aime
     elif ds_name == "lcb":
-        df = load_dataset("livecodebench/code_generation_lite", version_tag="release_v2")
+        ds = load_dataset("livecodebench/code_generation_lite", version_tag="release_v5")
+        df = ds["test"].to_pandas()
+        df = df[df["difficulty"] == "hard"]
+        prep = build_prompt_lcb
     else:
         try:
             df = load_dataset(name).to_pandas()
