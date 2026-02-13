@@ -93,6 +93,7 @@ def _worker(
         samples_needed = samples - len(all_outputs)
         n_calls = math.ceil(samples_needed / chunk_size) if samples_needed > 0 else 0
         chunk_offset = len(all_outputs) // chunk_size
+        # perplexities = []
 
         for c in range(n_calls):
             n = min(chunk_size, samples_needed - c * chunk_size)
@@ -108,6 +109,7 @@ def _worker(
                 top_p=1.0 if entropy_gate_mode == "topk" else top_p,
                 seed=None if seed is None else (seed + chunk_offset + c),
                 output_kind=RequestOutputKind.FINAL_ONLY,
+                # logprobs=1,
                 extra_args={
                     "entropy_gate": True,
                     "h_threshold": h_threshold,
@@ -121,6 +123,32 @@ def _worker(
 
             res = llm.generate([prompt], [sp], use_tqdm=not no_tqdm)[0]
             all_outputs.extend([o.text for o in res.outputs])
+            
+            # # Extract outputs and compute perplexity
+            # for output in res.outputs:
+            #     all_outputs.append(output.text)
+                
+            #     # Compute perplexity from logprobs
+            #     if output.logprobs:
+            #         log_probs_list = []
+            #         for token_logprobs in output.logprobs:
+            #             # token_logprobs is a dict: {token_id: Logprob object}
+            #             # Get the logprob of the selected token
+            #             if token_logprobs:
+            #                 # The selected token's logprob
+            #                 selected_logprob = list(token_logprobs.values())[0].logprob
+            #                 log_probs_list.append(selected_logprob)
+                    
+            #         if log_probs_list:
+            #             # Perplexity = exp(-mean(log_probs))
+            #             import math
+            #             mean_log_prob = sum(log_probs_list) / len(log_probs_list)
+            #             ppl = math.exp(-mean_log_prob)
+            #             perplexities.append(ppl)
+            #         else:
+            #             perplexities.append(None)
+            #     else:
+            #         raise ValueError("Problem in fetching perplexity.")
 
             n_high, n_total = forking_stats[0], forking_stats[1]
             pct = 100.0 * n_high / n_total if n_total > 0 else 0.0
@@ -145,7 +173,9 @@ def _worker(
             ent_p80 = float(torch_local.quantile(ent_t, 0.8).item())
             ent_n = len(ent_vals)
         else:
-            ent_mean, ent_p80, ent_n = None, None, 0
+            raise ValueError("Problem fetching entropy values")
+        
+        # avg_ppl = sum(perplexities) / len(perplexities)
 
         # Send entropy stats
         out_queue.put({
@@ -156,6 +186,7 @@ def _worker(
             "entropy_p80": ent_p80,
             "entropy_n": ent_n,
             "entropy_values": ent_vals,  # send raw values for global aggregation
+            # "perplexity": avg_ppl,
         })
 
         # Send final result for this qid
@@ -163,6 +194,7 @@ def _worker(
             "id": qid,
             "prompt": prompt,
             "generations": all_outputs,
+            # "perplexities": perplexities,
             "meta": {
                 "gpu": gpu_id,
                 "samples": samples,
@@ -175,6 +207,7 @@ def _worker(
                 "t_low": t_low,
                 "entropy_avg": ent_mean,
                 "entropy_p80": ent_p80,
+                # "perplexity_avg": avg_ppl,
             }
         })
 
@@ -211,7 +244,15 @@ def main(args):
 
     # Load prompts
     df, prep = get_dataset(args.dataset_name)
-    out_path = Path(args.out_path)
+    mode = (f"temp_{args.temperature:.1f}_{args.t_high:.1f}_{args.t_low:.1f}"
+            if args.entropy_gate_mode == "temp"
+            else f"topk_{args.entropy_gate_top_k}")
+    
+    file_name = f"{args.dataset_name.upper()}/{args.model.split("/")[-1]}_{mode}_{args.max_tokens}.jsonl"
+    full_path = os.path.join(args.out_dir, file_name)
+    assert not os.path.exists(full_path)
+    print(f"Saving results to {full_path}")
+    out_path = Path(full_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Load existing output
@@ -303,6 +344,7 @@ def main(args):
             avg = msg.get("entropy_avg")
             p80 = msg.get("entropy_p80")
             n = msg.get("entropy_n", 0)
+            # avg_ppl = msg.get("preplexity", 0)
 
             avg_s = f"{avg:.4f}" if avg is not None else "N/A"
             p80_s = f"{p80:.4f}" if p80 is not None else "N/A"

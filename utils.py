@@ -61,7 +61,7 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="Qwen/Qwen3-8B")
     ap.add_argument('-d', "--dataset-name", type=str, required=True)
-    ap.add_argument("--out-path", type=str, required=True)
+    ap.add_argument("--out-dir", type=str, required=True)
     ap.add_argument("-q", "--quantization", type=str, default=None, choices=[None, "bitsandbytes", "fp8"])
     ap.add_argument("--dtype", type=str, default="bfloat16", choices=["auto", "float16", "bfloat16"])
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.9)
