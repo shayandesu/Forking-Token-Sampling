@@ -7,6 +7,7 @@ from utils import parse_args, get_dataset
 from tqdm import tqdm
 from pprint import pprint
 from pathlib import Path
+from transformers import AutoTokenizer
 
 def _write_results(results: dict, df, out_path: Path) -> None:
     """Atomically write merged results to out_path in df.index order."""
@@ -81,11 +82,19 @@ def _worker(
 
     llm_kwargs.update({"logits_processors": [EntropyTempGate]})
     llm = LLM(**llm_kwargs)
+    tokenizer = llm.get_tokenizer()
 
     # Process prompts
     for qid, problem_text, existing_gens in todo_shard:
         prompt = prep(problem_text)
+        prompt = tokenizer.apply_chat_template(
+            prompt, 
+            tokenize=False, 
+            add_generation_prompt=True,
+            enable_thinking=True
+        )
         all_outputs = list(existing_gens) if existing_gens else []
+        curr_h_threshold = float(h_threshold)
 
         # Clear entropy collector for this qid
         entropy_collector[:] = []
@@ -94,6 +103,8 @@ def _worker(
         n_calls = math.ceil(samples_needed / chunk_size) if samples_needed > 0 else 0
         chunk_offset = len(all_outputs) // chunk_size
         # perplexities = []
+        
+        ent_vals_all = []
 
         for c in range(n_calls):
             n = min(chunk_size, samples_needed - c * chunk_size)
@@ -101,6 +112,8 @@ def _worker(
                 break
 
             forking_stats[0] = forking_stats[1] = 0
+            
+            entropy_collector[:] = []
 
             sp = SamplingParams(
                 n=n,
@@ -112,7 +125,7 @@ def _worker(
                 # logprobs=1,
                 extra_args={
                     "entropy_gate": True,
-                    "h_threshold": h_threshold,
+                    "h_threshold": curr_h_threshold,
                     "t_ref": temperature,
                     "t_high": t_high,
                     "t_low": t_low,
@@ -124,31 +137,17 @@ def _worker(
             res = llm.generate([prompt], [sp], use_tqdm=not no_tqdm)[0]
             all_outputs.extend([o.text for o in res.outputs])
             
-            # # Extract outputs and compute perplexity
-            # for output in res.outputs:
-            #     all_outputs.append(output.text)
-                
-            #     # Compute perplexity from logprobs
-            #     if output.logprobs:
-            #         log_probs_list = []
-            #         for token_logprobs in output.logprobs:
-            #             # token_logprobs is a dict: {token_id: Logprob object}
-            #             # Get the logprob of the selected token
-            #             if token_logprobs:
-            #                 # The selected token's logprob
-            #                 selected_logprob = list(token_logprobs.values())[0].logprob
-            #                 log_probs_list.append(selected_logprob)
-                    
-            #         if log_probs_list:
-            #             # Perplexity = exp(-mean(log_probs))
-            #             import math
-            #             mean_log_prob = sum(log_probs_list) / len(log_probs_list)
-            #             ppl = math.exp(-mean_log_prob)
-            #             perplexities.append(ppl)
-            #         else:
-            #             perplexities.append(None)
-            #     else:
-            #         raise ValueError("Problem in fetching perplexity.")
+            ent_vals_chunk = list(entropy_collector)
+            if not ent_vals_chunk:
+                raise ValueError("No entropy values collected for this chunk")
+            
+            import torch as torch_local
+            ent_t = torch_local.tensor(ent_vals_chunk, dtype=torch_local.float32)
+            chunk_p80 = float(torch_local.quantile(ent_t, 0.8).item())
+
+            curr_h_threshold = 0.9 * curr_h_threshold + 0.1 * chunk_p80
+            ent_vals_all.extend(ent_vals_chunk)
+
 
             n_high, n_total = forking_stats[0], forking_stats[1]
             pct = 100.0 * n_high / n_total if n_total > 0 else 0.0
@@ -162,6 +161,7 @@ def _worker(
                 "forking_count": n_high,
                 "forking_pct": pct,
                 "token_count": n_total,
+                "curr_thresh": curr_h_threshold
             })
 
         # Compute entropy stats for this qid
@@ -248,7 +248,7 @@ def main(args):
             if args.entropy_gate_mode == "temp"
             else f"topk_{args.entropy_gate_top_k}")
     
-    file_name = f"{args.dataset_name.upper()}/{args.model.split("/")[-1]}_{mode}_{args.max_tokens}.jsonl"
+    file_name = f"{args.dataset_name.upper()}/{args.model.split("/")[-1]}_{mode}_{args.max_tokens}_{args.seed}.jsonl"
     full_path = os.path.join(args.out_dir, file_name)
     assert not os.path.exists(full_path)
     print(f"Saving results to {full_path}")
@@ -333,9 +333,10 @@ def main(args):
             fc = msg.get("forking_count", 0)
             fp = msg.get("forking_pct", 0.0)
             tc = msg.get("token_count", 0)
+            cth = msg.get("curr_thresh", 0)
             print(
                 f"[gpu {msg['gpu']}] qid={msg['qid']} {msg['call']}/{msg['total']} "
-                f"— forking tokens: {fc}/{tc} ({fp:.1f}%)",
+                f"— forking tokens: {fc}/{tc} ({fp:.1f}%), current threshold: {cth:.3f}",
                 flush=True,
             )
             continue

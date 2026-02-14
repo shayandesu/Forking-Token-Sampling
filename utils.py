@@ -4,10 +4,9 @@ from datasets import load_dataset
 
 
 def build_prompt_aime(question):
-    return (
-        "Please reason step by step, and put your final answer within \\boxed{}\n"
-        f"{question}"
-    )
+    return [
+        {"role": "user", "content": f"Please reason step by step, and put your final answer within \\boxed{{}}.\n{question}"}
+    ]
     
 def build_prompt_lcb(question):
     return (
@@ -77,7 +76,7 @@ def parse_args(argv=None):
     ap.add_argument("--seed", type=int, default=None)
 
     ap.add_argument("--h-threshold", type=float, default=0.672)
-    ap.add_argument("--t-high", type=float, default=2.0)
+    ap.add_argument("--t-high", type=float, default=1.4)
     ap.add_argument("--t-low", type=float, default=0.6)
     ap.add_argument(
         "--entropy-gate-mode",
