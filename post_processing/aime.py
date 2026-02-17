@@ -2,6 +2,7 @@ import os
 import re
 import json
 import argparse
+from pathlib import Path
 
 try:
     from . import evaluate_pass_at_k
@@ -9,6 +10,7 @@ except ImportError:
     import sys
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
+        
         sys.path.insert(0, _root)
     from post_processing import evaluate_pass_at_k
 
@@ -64,17 +66,21 @@ def evaluate_correctness(predicted_answer, ground_truth):
 
 
 
-def evaluate_aime(df, output_json_path, k_values=(1, 4, 8, 16)):
+def evaluate_aime(df, eval_path, k_values=(1, 4, 8, 16, 100)):
     """
     Load main.py output JSONL, compute accuracy and pass@k, save results to a txt file
     next to output_json_path. df must have the same row order/index as the run (Answer column).
     """
     answer_col = "Answer" if "Answer" in df.columns else "answer"
-    with open(output_json_path, "r", encoding="utf-8") as f:
+    if isinstance(eval_path, str):
+        eval_path = Path(eval_path)
+    
+    gen_path = eval_path / "generations.jsonl"
+    with open(gen_path, "r", encoding="utf-8") as f:
         records = [json.loads(line) for line in f if line.strip()]
 
     # Per-problem: num_correct, num_samples
-    results = []
+    results = {}
     for rec in records:
         qid = rec["id"]
         generations = rec.get("generations", [])
@@ -84,46 +90,46 @@ def evaluate_aime(df, output_json_path, k_values=(1, 4, 8, 16)):
             pred = extract_answer_from_response(text)
             if evaluate_correctness(pred, ground_truth):
                 num_correct += 1
-        results.append((num_correct, len(generations)))
+        results[qid] = (num_correct, len(generations))
+        print(f"{qid+1}: {num_correct}/{len(generations)}")
 
     n_problems = len(results)
     if n_problems == 0:
-        raise ValueError(f"No records in {output_json_path}")
+        raise ValueError(f"No records in {eval_path}")
 
     # Accuracy: fraction of problems with at least one correct generation
-    accuracy = sum(1 for c, n in results if c > 0) / n_problems
+    accuracy = sum(1 for c, n in list(results.values()) if c > 0) / n_problems
 
     # pass@k (unbiased) averaged over problems
     pass_at_k = {}
     for k in k_values:
-        pass_at_k[k] = sum(evaluate_pass_at_k(c, n, k) for c, n in results) / n_problems
+        pass_at_k[k] = sum(evaluate_pass_at_k(c, n, k) for c, n in list(results.values())) / n_problems
+    
+    for k in k_values:
+        results[f'pass_at_{k}'] = pass_at_k[k]
+    
+    results["accuracy"] = accuracy
 
     # Save next to input json file
-    base, _ = os.path.splitext(output_json_path)
-    out_txt_path = base + "_metrics.txt"
-    with open(out_txt_path, "w", encoding="utf-8") as f:
-        f.write(f"# Evaluation of {output_json_path}\n")
-        f.write(f"# Problems: {n_problems}\n\n")
-        f.write(f"accuracy: {accuracy:.4f}\n")
-        for k in k_values:
-            f.write(f"pass@{k}: {pass_at_k[k]:.4f}\n")
+    out_path = eval_path / "pass.jsonl"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
 
-    return {"accuracy": accuracy, "pass_at_k": pass_at_k, "out_path": out_txt_path}
+    return {"accuracy": accuracy, "pass_at_k": pass_at_k, "out_path": out_path}
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-name", type=str, required=True)
-    parser.add_argument("--out-path", type=str, required=True)
-    args = parser.parse_args()
-    
-    if args.dataset_name not in ["aime2024", "aime2025"]:
+def main(args):
+    if args.dataset_name.lower() not in ["aime2024", "aime2025"]:
         raise ValueError(f"Dataset {args.dataset_name} not supported for AIME evaluation")
     
     df, _ = get_dataset(args.dataset_name)
-    results = evaluate_aime(df, args.out_path)
+    results = evaluate_aime(df, args.eval_path)
     print(results)
     
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-name", type=str, required=True)
+    parser.add_argument("--eval-path", type=str, required=True)
+    args = parser.parse_args()
     main()

@@ -25,10 +25,13 @@ def _load_existing(out_path: Path, samples: int) -> dict:
     result = {}
     if not out_path.exists():
         return result
+    
+    print("File Already Exists. Checking the file...")
 
     with open(out_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
+            print(line[:100])
             if not line:
                 continue
             try:
@@ -250,7 +253,7 @@ def main(args):
     
     file_name = f"{args.dataset_name.upper()}/{args.model.split("/")[-1]}_{mode}_{args.max_tokens}_{args.seed}.jsonl"
     full_path = os.path.join(args.out_dir, file_name)
-    assert not os.path.exists(full_path)
+    # assert not os.path.exists(full_path)
     print(f"Saving results to {full_path}")
     out_path = Path(full_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
