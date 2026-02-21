@@ -54,11 +54,9 @@ def main(args):
     
     gen_path = Path(args.eval_path) / "generations.jsonl"
     
-    ds = get_dataset(args.eval_path)
+    ds = get_dataset(gen_path)
     
-    out_path = Path(out_path)
-        
-    out_path = out_path / "g-vendi"    
+    out_path = Path(out_path) / "g-vendi"    
     out_path.mkdir(parents=True, exist_ok=True)
     
     print("Saving to ", out_path)
@@ -82,8 +80,7 @@ def main(args):
     
     scores['average'] = avg_score
     
-    name = Path(args.eval_path).stem
-    save_path = out_path / f"{name}_gvendi.jsonl"
+    save_path = Path(args.eval_path) / "gvendi_scores.jsonl"
     
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(scores, f, ensure_ascii=False, indent=2)
